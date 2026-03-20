@@ -1,14 +1,20 @@
-import { resolveAuthStorePathForDisplay } from "../../agents/auth-profiles.js";
+import { buildBrowseProvidersButton } from "openclaw/plugin-sdk/telegram";
+import {
+  ensureAuthProfileStore,
+  resolveAuthStorePathForDisplay,
+} from "../../agents/auth-profiles.js";
 import {
   type ModelAliasIndex,
   modelKey,
   normalizeProviderId,
+  normalizeProviderIdForAuth,
   resolveConfiguredModelRef,
   resolveModelRefFromString,
 } from "../../agents/model-selection.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { buildBrowseProvidersButton } from "../../telegram/model-buttons.js";
+import type { SessionEntry } from "../../config/sessions.js";
 import { shortenHomePath } from "../../utils.js";
+import { resolveSelectedAndActiveModel } from "../model-runtime.js";
 import type { ReplyPayload } from "../types.js";
 import { resolveModelsCommandReply } from "./commands-models.js";
 import {
@@ -198,6 +204,7 @@ export async function maybeHandleModelDirectiveInfo(params: {
   allowedModelCatalog: Array<{ provider: string; id?: string; name?: string }>;
   resetModelOverride: boolean;
   surface?: string;
+  sessionEntry?: Pick<SessionEntry, "modelProvider" | "model">;
 }): Promise<ReplyPayload | undefined> {
   if (!params.directives.hasModelDirective) {
     return undefined;
@@ -233,31 +240,45 @@ export async function maybeHandleModelDirectiveInfo(params: {
   }
 
   if (wantsSummary) {
-    const current = `${params.provider}/${params.model}`;
+    const modelRefs = resolveSelectedAndActiveModel({
+      selectedProvider: params.provider,
+      selectedModel: params.model,
+      sessionEntry: params.sessionEntry,
+    });
+    const current = modelRefs.selected.label;
     const isTelegram = params.surface === "telegram";
+    const activeRuntimeLine = modelRefs.activeDiffers
+      ? `Active: ${modelRefs.active.label} (runtime)`
+      : null;
 
     if (isTelegram) {
       const buttons = buildBrowseProvidersButton();
       return {
         text: [
-          `Current: ${current}`,
+          `Current: ${current}${modelRefs.activeDiffers ? " (selected)" : ""}`,
+          activeRuntimeLine,
           "",
           "Tap below to browse models, or use:",
           "/model <provider/model> to switch",
           "/model status for details",
-        ].join("\n"),
+        ]
+          .filter(Boolean)
+          .join("\n"),
         channelData: { telegram: { buttons } },
       };
     }
 
     return {
       text: [
-        `Current: ${current}`,
+        `Current: ${current}${modelRefs.activeDiffers ? " (selected)" : ""}`,
+        activeRuntimeLine,
         "",
         "Switch: /model <provider/model>",
         "Browse: /models (providers) or /models <provider> (models)",
         "More: /model status",
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     };
   }
 
@@ -284,14 +305,20 @@ export async function maybeHandleModelDirectiveInfo(params: {
     authByProvider.set(provider, formatAuthLabel(auth));
   }
 
-  const current = `${params.provider}/${params.model}`;
+  const modelRefs = resolveSelectedAndActiveModel({
+    selectedProvider: params.provider,
+    selectedModel: params.model,
+    sessionEntry: params.sessionEntry,
+  });
+  const current = modelRefs.selected.label;
   const defaultLabel = `${params.defaultProvider}/${params.defaultModel}`;
   const lines = [
-    `Current: ${current}`,
+    `Current: ${current}${modelRefs.activeDiffers ? " (selected)" : ""}`,
+    modelRefs.activeDiffers ? `Active: ${modelRefs.active.label} (runtime)` : null,
     `Default: ${defaultLabel}`,
     `Agent: ${params.activeAgentId}`,
     `Auth file: ${formatPath(resolveAuthStorePathForDisplay(params.agentDir))}`,
-  ];
+  ].filter((line): line is string => Boolean(line));
   if (params.resetModelOverride) {
     lines.push(`(previous selection reset to default)`);
   }
@@ -330,6 +357,39 @@ export async function maybeHandleModelDirectiveInfo(params: {
   return { text: lines.join("\n") };
 }
 
+function resolveStoredNumericProfileModelDirective(params: { raw: string; agentDir: string }): {
+  modelRaw: string;
+  profileId: string;
+  profileProvider: string;
+} | null {
+  const trimmed = params.raw.trim();
+  const lastSlash = trimmed.lastIndexOf("/");
+  const profileDelimiter = trimmed.indexOf("@", lastSlash + 1);
+  if (profileDelimiter <= 0) {
+    return null;
+  }
+
+  const profileId = trimmed.slice(profileDelimiter + 1).trim();
+  if (!/^\d{8}$/.test(profileId)) {
+    return null;
+  }
+
+  const modelRaw = trimmed.slice(0, profileDelimiter).trim();
+  if (!modelRaw) {
+    return null;
+  }
+
+  const store = ensureAuthProfileStore(params.agentDir, {
+    allowKeychainPrompt: false,
+  });
+  const profile = store.profiles[profileId];
+  if (!profile) {
+    return null;
+  }
+
+  return { modelRaw, profileId, profileProvider: profile.provider };
+}
+
 export function resolveModelSelectionFromDirective(params: {
   directives: InlineDirectives;
   cfg: OpenClawConfig;
@@ -353,6 +413,28 @@ export function resolveModelSelectionFromDirective(params: {
   }
 
   const raw = params.directives.rawModelDirective.trim();
+  const storedNumericProfile =
+    params.directives.rawModelProfile === undefined
+      ? resolveStoredNumericProfileModelDirective({
+          raw,
+          agentDir: params.agentDir,
+        })
+      : null;
+  const storedNumericProfileSelection = storedNumericProfile
+    ? resolveModelDirectiveSelection({
+        raw: storedNumericProfile.modelRaw,
+        defaultProvider: params.defaultProvider,
+        defaultModel: params.defaultModel,
+        aliasIndex: params.aliasIndex,
+        allowedModelKeys: params.allowedModelKeys,
+      })
+    : null;
+  const useStoredNumericProfile =
+    Boolean(storedNumericProfileSelection?.selection) &&
+    normalizeProviderIdForAuth(storedNumericProfileSelection?.selection?.provider ?? "") ===
+      normalizeProviderIdForAuth(storedNumericProfile?.profileProvider ?? "");
+  const modelRaw =
+    useStoredNumericProfile && storedNumericProfile ? storedNumericProfile.modelRaw : raw;
   let modelSelection: ModelDirectiveSelection | undefined;
 
   if (/^[0-9]+$/.test(raw)) {
@@ -367,7 +449,7 @@ export function resolveModelSelectionFromDirective(params: {
   }
 
   const explicit = resolveModelRefFromString({
-    raw,
+    raw: modelRaw,
     defaultProvider: params.defaultProvider,
     aliasIndex: params.aliasIndex,
   });
@@ -387,7 +469,7 @@ export function resolveModelSelectionFromDirective(params: {
 
   if (!modelSelection) {
     const resolved = resolveModelDirectiveSelection({
-      raw,
+      raw: modelRaw,
       defaultProvider: params.defaultProvider,
       defaultModel: params.defaultModel,
       aliasIndex: params.aliasIndex,
@@ -404,9 +486,12 @@ export function resolveModelSelectionFromDirective(params: {
   }
 
   let profileOverride: string | undefined;
-  if (modelSelection && params.directives.rawModelProfile) {
+  const rawProfile =
+    params.directives.rawModelProfile ??
+    (useStoredNumericProfile ? storedNumericProfile?.profileId : undefined);
+  if (modelSelection && rawProfile) {
     const profileResolved = resolveProfileOverride({
-      rawProfile: params.directives.rawModelProfile,
+      rawProfile,
       provider: modelSelection.provider,
       cfg: params.cfg,
       agentDir: params.agentDir,
